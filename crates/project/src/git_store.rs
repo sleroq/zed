@@ -3040,12 +3040,17 @@ impl GitStore {
             {
                 if let Some(repo) = self.repositories.get(repo_id) {
                     let repository_state = repo.read(cx).repository_state.clone();
-                    cx.background_spawn(async move {
-                        if let Ok(RepositoryState::Local(state)) = repository_state.await {
+                    let repo = repo.downgrade();
+                    cx.spawn(async move |_, cx| {
+                        if let RepositoryState::Local(state) =
+                            repository_state.await.map_err(|error| anyhow!(error))?
+                        {
                             state.backend.set_trusted(is_trusted);
+                            repo.update(cx, |repo, cx| repo.reload_buffer_diff_bases(cx))?;
                         }
+                        anyhow::Ok(())
                     })
-                    .detach();
+                    .detach_and_log_err(cx);
                 }
             }
         }
@@ -6787,7 +6792,7 @@ impl Repository {
                     })
                 })?;
 
-                let buffer_diff_base_changes = cx
+                let Some(buffer_diff_base_changes) = cx
                     .background_spawn(async move {
                         let mut revisions = Vec::new();
                         for (_, repo_path, is_symlink, current_index_text, current_head_text) in
@@ -6801,12 +6806,8 @@ impl Repository {
                             }
                         }
 
-                        let mut loaded_revisions = backend
-                            .load_revisions(revisions)
-                            .await
-                            .log_err()
-                            .into_iter()
-                            .flatten();
+                        let mut loaded_revisions =
+                            backend.load_revisions(revisions).await?.into_iter();
 
                         let mut changes = Vec::new();
                         for (buffer, _, is_symlink, current_index_text, current_head_text) in
@@ -6862,9 +6863,13 @@ impl Repository {
 
                             changes.push((buffer.clone(), change))
                         }
-                        changes
+                        anyhow::Ok(changes)
                     })
-                    .await;
+                    .await
+                    .log_err()
+                else {
+                    return Ok(());
+                };
 
                 git_store.update(&mut cx, |git_store, cx| {
                     for (buffer, diff_bases_change) in buffer_diff_base_changes {
@@ -10346,8 +10351,10 @@ impl Repository {
         let rx = self.send_job("load_staged_text", None, move |state, _| async move {
             match state {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
-                    .load_index_text(repo_path)
-                    .await
+                    .load_revisions(vec![format!(":{}", repo_path.as_unix_str())])
+                    .await?
+                    .pop()
+                    .flatten()
                     .map(decode_git_text)
                     .transpose(),
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {

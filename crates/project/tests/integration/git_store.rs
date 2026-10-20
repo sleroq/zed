@@ -1630,6 +1630,150 @@ mod trust_tests {
         });
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_real_filter_bases_follow_trust(cx: &mut TestAppContext) {
+        check_real_filter_reload(cx, false).await;
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_real_filter_reload_failure_preserves_all_bases(cx: &mut TestAppContext) {
+        check_real_filter_reload(cx, true).await;
+    }
+
+    #[cfg(unix)]
+    async fn check_real_filter_reload(cx: &mut TestAppContext, failing: bool) {
+        use crate::{git_add, git_cmd, git_commit, git_init};
+        use fs::RealFs;
+        cx.executor().allow_parking();
+
+        init_test(cx);
+        let root = tempfile::tempdir().unwrap();
+        git_init(root.path());
+        for (key, value) in [
+            ("filter.test.clean", "sed 's/plain/raw/g'"),
+            (
+                "filter.test.smudge",
+                if failing {
+                    "exit 1"
+                } else {
+                    "sed 's/raw/plain/g'"
+                },
+            ),
+            ("filter.test.required", "true"),
+        ] {
+            let output = smol::process::Command::from(git_cmd(root.path()))
+                .args(["config", key, value])
+                .output()
+                .await
+                .expect("configure checkout filter");
+            assert!(
+                output.status.success(),
+                "git config failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(
+            root.path().join(".gitattributes"),
+            "filtered.txt filter=test\n",
+        )
+        .unwrap();
+        for name in ["filtered.txt", "ordinary.txt"] {
+            std::fs::write(root.path().join(name), "plain head\n").unwrap();
+        }
+        git_add(".", root.path());
+        git_commit("Initial", root.path());
+        for name in ["filtered.txt", "ordinary.txt"] {
+            std::fs::write(root.path().join(name), "plain index\n").unwrap();
+        }
+        git_add(".", root.path());
+        for name in ["filtered.txt", "ordinary.txt"] {
+            std::fs::write(root.path().join(name), "plain working\n").unwrap();
+        }
+        cx.update(|cx| init(DbTrustedPaths::default(), cx));
+        let project =
+            Project::test_with_worktree_trust(RealFs::new(None, cx.executor()), [root.path()], cx)
+                .await;
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+        let worktree_id = worktree_store.read_with(cx, |store, cx| {
+            store.worktrees().next().unwrap().read(cx).id()
+        });
+        let mut diffs = Vec::new();
+        for name in ["filtered.txt", "ordinary.txt"] {
+            let buffer = project
+                .update(cx, |project, cx| {
+                    project.open_local_buffer(&root.path().join(name), cx)
+                })
+                .await
+                .unwrap();
+            let unstaged = project
+                .update(cx, |project, cx| {
+                    project.open_unstaged_diff(buffer.clone(), cx)
+                })
+                .await
+                .unwrap();
+            let uncommitted = project
+                .update(cx, |project, cx| {
+                    project.open_uncommitted_diff(buffer.clone(), cx)
+                })
+                .await
+                .unwrap();
+            diffs.push((buffer, unstaged, uncommitted));
+        }
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+        let trusted_worktrees = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+        for trusted in [false, true, false] {
+            if trusted {
+                trusted_worktrees.update(cx, |store, cx| {
+                    store.trust(
+                        &worktree_store,
+                        HashSet::from_iter([PathTrust::Worktree(worktree_id)]),
+                        cx,
+                    )
+                });
+            } else {
+                trusted_worktrees.update(cx, |store, cx| {
+                    store.restrict(
+                        worktree_store.downgrade(),
+                        HashSet::from_iter([PathTrust::Worktree(worktree_id)]),
+                        cx,
+                    )
+                });
+            }
+            // Drain the trust handler so its reload is queued before the barrier.
+            cx.executor().run_until_parked();
+            repository
+                .update(cx, |repository, _| {
+                    repository.send_job("test reload barrier", None, |_, _| async {})
+                })
+                .await
+                .unwrap();
+            cx.executor().run_until_parked();
+            for (index, (_, unstaged, uncommitted)) in diffs.iter().enumerate() {
+                let prefix = if index == 0 && (!trusted || failing) {
+                    "raw"
+                } else {
+                    "plain"
+                };
+                unstaged.read_with(cx, |diff, cx| {
+                    assert_eq!(
+                        diff.base_text_string(cx).as_deref(),
+                        Some(format!("{prefix} index\n").as_str())
+                    );
+                });
+                uncommitted.read_with(cx, |diff, cx| {
+                    assert_eq!(
+                        diff.base_text_string(cx).as_deref(),
+                        Some(format!("{prefix} head\n").as_str())
+                    );
+                });
+            }
+        }
+    }
+
     #[gpui::test]
     async fn test_repository_defaults_to_untrusted_without_trust_system(cx: &mut TestAppContext) {
         init_test(cx);

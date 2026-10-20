@@ -13,6 +13,7 @@ use futures::future::BoxFuture;
 use futures::io::BufWriter;
 use futures::{AsyncWriteExt, FutureExt as _, select_biased};
 use gpui::{AppContext as _, AsyncApp, BackgroundExecutor, SharedString, Task};
+use itertools::Itertools as _;
 use parking_lot::Mutex;
 use rope::Rope;
 use schemars::JsonSchema;
@@ -93,7 +94,7 @@ fn linked_worktree_git_dir(worktree_path: &Path) -> Result<PathBuf> {
 
 fn normalize_git_metadata_path(path: PathBuf) -> Result<PathBuf> {
     paths::normalize_lexically(&path)
-        .map_err(|_| anyhow!("git metadata path escapes its filesystem root: {path:?}"))
+        .with_context(|| format!("git metadata path escapes its filesystem root: {path:?}"))
 }
 
 /// Commit data needed for the git graph visualization.
@@ -149,10 +150,10 @@ impl CommitDataReader {
         self.request_tx
             .send(CommitDataRequest { sha, response_tx })
             .await
-            .map_err(|_| anyhow!("commit data reader task closed"))?;
+            .context("commit data reader task closed")?;
         response_rx
             .await
-            .map_err(|_| anyhow!("commit data reader task dropped response"))?
+            .context("commit data reader task dropped response")?
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1829,6 +1830,7 @@ impl GitRepository for RealGitRepository {
         revisions: Vec<String>,
     ) -> BoxFuture<'_, Result<Vec<Option<Vec<u8>>>>> {
         let git = self.git_binary();
+        let apply_filters = git.is_trusted && self.working_directory.is_some();
         self.executor
             .spawn(async move {
                 if revisions.is_empty() {
@@ -1889,6 +1891,9 @@ impl GitRepository for RealGitRepository {
 
                 drop(stdin);
                 process.output().await?;
+                if apply_filters {
+                    git.apply_checkout_filters(&revisions, &mut results).await?;
+                }
                 Ok(results)
             })
             .boxed()
@@ -3990,6 +3995,66 @@ impl GitBinary {
         Ok(String::from_utf8(output.stdout)?)
     }
 
+    async fn apply_checkout_filters(
+        &self,
+        revisions: &[String],
+        contents: &mut [Option<Vec<u8>>],
+    ) -> Result<()> {
+        let paths = revisions
+            .iter()
+            .zip(contents.iter())
+            .filter(|(_, content)| content.is_some())
+            .filter_map(|(revision, _)| revision.split_once(':').map(|(_, path)| path))
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let output = self
+            .build_command(&["check-attr", "-z", "filter", "--"])
+            .args(paths)
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            GitBinaryCommandError {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                status: output.status,
+            }
+        );
+        let attributes = String::from_utf8(output.stdout)?;
+        let filtered_paths = attributes
+            .split('\0')
+            .tuples::<(_, _, _)>()
+            .filter_map(|(path, _, filter)| {
+                (!matches!(filter, "unspecified" | "unset")).then_some(path)
+            })
+            .collect::<HashSet<_>>();
+
+        for (revision, content) in revisions.iter().zip(contents) {
+            if content.is_some()
+                && let Some((_, path)) = revision.split_once(':')
+                && filtered_paths.contains(path)
+            {
+                // Filtered batch output reports the stored blob size, not the converted
+                // size, so it cannot be read using the raw batch protocol above.
+                let output = self
+                    .build_command(&["cat-file", "--filters", revision])
+                    .output()
+                    .await
+                    .with_context(|| format!("applying checkout filters to {revision:?}"))?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Failed to apply checkout filters to {revision:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                *content = Some(output.stdout);
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::disallowed_methods)]
     pub(crate) fn build_command<S>(&self, args: &[S]) -> util::command::Command
     where
@@ -5989,6 +6054,134 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_load_revisions_with_checkout_filters(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().expect("create repository directory");
+        git_init_repo(repo_dir.path());
+        git_command(
+            repo_dir.path(),
+            [
+                "config",
+                "filter.test.clean",
+                "sed 's/^plaintext:/stored:/'",
+            ],
+        );
+        git_command(
+            repo_dir.path(),
+            [
+                "config",
+                "filter.test.smudge",
+                "echo ran >> filter-ran; sed 's/^stored:/plaintext:/'",
+            ],
+        );
+        git_command(repo_dir.path(), ["config", "filter.test.required", "true"]);
+        fs::write(
+            repo_dir.path().join(".gitattributes"),
+            "*.filtered filter=test\n",
+        )
+        .expect("write attributes");
+        fs::create_dir(repo_dir.path().join("directory")).expect("create file directory");
+        let path = "directory/file with spaces.filtered";
+        let committed_text = b"plaintext:one\noriginal second\noriginal third\n";
+        let stored_text = b"stored:one\noriginal second\noriginal third\n";
+        fs::write(repo_dir.path().join(path), committed_text).expect("write filtered file");
+        fs::write(repo_dir.path().join("ordinary"), "ordinary contents")
+            .expect("write ordinary file");
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "Initial commit"]);
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("open repository");
+        let revisions = vec![
+            format!("HEAD:{path}"),
+            format!(":{path}"),
+            "HEAD:ordinary".into(),
+            "HEAD:missing file.filtered".into(),
+            "HEAD:directory".into(),
+            "HEAD".into(),
+        ];
+        let marker_path = repo_dir.path().join("filter-ran");
+        assert!(!marker_path.exists());
+        assert_eq!(
+            repo.load_revisions(revisions.clone())
+                .await
+                .expect("load untrusted revisions"),
+            vec![
+                Some(stored_text.to_vec()),
+                Some(stored_text.to_vec()),
+                Some(b"ordinary contents".to_vec()),
+                None,
+                None,
+                None,
+            ]
+        );
+        assert!(
+            !marker_path.exists(),
+            "untrusted reads must not run filters"
+        );
+
+        repo.set_trusted(true);
+        let worktree_text = b"plaintext:two\nchanged second\noriginal third\n";
+        let index_text = b"plaintext:two\noriginal second\noriginal third\n";
+        fs::write(repo_dir.path().join(path), worktree_text).expect("edit worktree file");
+        repo.set_index_text(
+            repo_path(path),
+            Some(index_text.to_vec()),
+            Arc::new(HashMap::default()),
+            false,
+        )
+        .await
+        .expect("stage one change through the clean filter");
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["show", &format!(":{path}")]),
+            "stored:two\noriginal second\noriginal third"
+        );
+        assert_eq!(
+            repo.load_revisions(revisions)
+                .await
+                .expect("load filtered revisions"),
+            vec![
+                Some(committed_text.to_vec()),
+                Some(index_text.to_vec()),
+                Some(b"ordinary contents".to_vec()),
+                None,
+                None,
+                None,
+            ]
+        );
+        assert!(
+            marker_path.exists(),
+            "trusted reads must run the smudge filter"
+        );
+        assert_eq!(
+            fs::read(repo_dir.path().join(path)).expect("read worktree file"),
+            worktree_text
+        );
+
+        git_command(
+            repo_dir.path(),
+            [
+                "config",
+                "filter.test.smudge",
+                "echo 'smudge failed' >&2; exit 1",
+            ],
+        );
+        let error = repo
+            .load_revisions(vec![format!("HEAD:{path}")])
+            .await
+            .expect_err("required filter failures must not look like missing files");
+        assert!(error.to_string().contains("smudge failed"), "{error:#}");
     }
 
     #[gpui::test]
